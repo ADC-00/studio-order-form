@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title>Digital Order & Estimation Form - Nirav Dabgar</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap');
@@ -397,9 +399,22 @@
     <button id="btnWhatsApp" type="button" class="flex-1 py-3 px-4 bg-emerald-600 hover:bg-emerald-500 active:scale-95 text-white font-extrabold text-xs sm:text-sm rounded-xl transition flex items-center justify-center gap-2 shadow-lg">
       <i class="fa-brands fa-whatsapp text-lg"></i><span>Share via WhatsApp</span>
     </button>
-    <button id="btnPrint" type="button" class="flex-1 py-3 px-4 bg-rose-600 hover:bg-rose-500 active:scale-95 text-white font-extrabold text-xs sm:text-sm rounded-xl transition flex items-center justify-center gap-2 shadow-lg">
-      <i class="fa-solid fa-print text-lg"></i><span>Print / PDF</span>
+    <button id="btnPdf" type="button" class="flex-1 py-3 px-4 bg-rose-600 hover:bg-rose-500 active:scale-95 text-white font-extrabold text-xs sm:text-sm rounded-xl transition flex items-center justify-center gap-2 shadow-lg">
+      <i class="fa-solid fa-file-pdf text-lg"></i><span>PDF</span>
     </button>
+  </div>
+
+  <!-- Dialog (file name prompt + messages) -->
+  <div id="modal" class="no-print fixed inset-0 z-[100] hidden items-center justify-center bg-slate-950/70 p-4">
+    <div class="w-full max-w-sm bg-white rounded-2xl p-4 shadow-2xl border border-slate-300">
+      <h3 id="mTitle" class="text-base font-extrabold text-slate-900"></h3>
+      <p id="mMsg" class="text-sm text-slate-600 mt-1 break-words"></p>
+      <input id="mInput" type="text" autocomplete="off" class="hidden w-full mt-3 px-3 py-2 rounded-xl border border-slate-300 focus:border-rose-600 focus:ring-1 focus:ring-rose-500 outline-none text-sm font-bold text-slate-900" />
+      <div class="flex justify-end gap-2 mt-4">
+        <button id="mCancel" type="button" class="px-4 py-2 text-sm font-bold rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700">Cancel</button>
+        <button id="mOk" type="button" class="px-4 py-2 text-sm font-bold rounded-xl bg-rose-600 hover:bg-rose-500 text-white">OK</button>
+      </div>
+    </div>
   </div>
 
   <script>
@@ -559,74 +574,191 @@
       calculateSlip();
     }
 
-    // ---------- WhatsApp ----------
-    function shareWhatsApp() {
-      const client = document.getElementById('clientName').value.trim() || 'Sir/Madam';
-      const mob = document.getElementById('clientMob').value.trim();
-      const dateVal = document.getElementById('billDate').value;
-      const total = document.getElementById('grandTotalDisplay').value;
-      const advance = document.getElementById('advanceInput').value || '0';
-      const balance = document.getElementById('resAmountDisplay').value;
+    // ---------- Dialog helpers ----------
+    function showDialog({ title, message = '', withInput = false, defaultValue = '', okText = 'OK', cancelText = 'Cancel' }) {
+      return new Promise(resolve => {
+        const modal = document.getElementById('modal');
+        const input = document.getElementById('mInput');
+        const ok = document.getElementById('mOk');
+        const cancel = document.getElementById('mCancel');
+        document.getElementById('mTitle').textContent = title;
+        document.getElementById('mMsg').textContent = message;
+        ok.textContent = okText;
+        cancel.textContent = cancelText;
+        input.classList.toggle('hidden', !withInput);
+        if (withInput) input.value = defaultValue;
+        modal.classList.remove('hidden');
+        modal.classList.add('flex');
+        if (withInput) setTimeout(() => { input.focus(); input.select(); }, 50);
 
-      const eventMap = {
-        chkWedding: 'Wedding', chkPreWedding: 'Pre-Wedding', chkRingCeremony: 'Ring Ceremony',
-        chkBirthday: 'Birthday', chkBabyShower: 'Baby Shower', chkMaternityShoot: 'Maternity Shoot'
-      };
-      const events = Object.keys(eventMap).filter(id => document.getElementById(id).checked).map(id => eventMap[id]);
+        const close = val => {
+          modal.classList.add('hidden');
+          modal.classList.remove('flex');
+          ok.onclick = cancel.onclick = input.onkeydown = null;
+          resolve(val);
+        };
+        ok.onclick = () => close(withInput ? input.value : true);
+        cancel.onclick = () => close(null);
+        input.onkeydown = e => {
+          if (e.key === 'Enter') ok.onclick();
+          if (e.key === 'Escape') cancel.onclick();
+        };
+      });
+    }
 
-      const sizes = [];
-      document.querySelectorAll('input[name="album_size"]:checked').forEach(c => sizes.push(c.value));
+    function setBusy(btn, busy, label) {
+      if (!btn) return;
+      if (busy) {
+        btn.dataset.html = btn.innerHTML;
+        btn.disabled = true;
+        btn.classList.add('opacity-70');
+        btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin text-lg"></i><span>${label}</span>`;
+      } else {
+        btn.disabled = false;
+        btn.classList.remove('opacity-70');
+        if (btn.dataset.html) btn.innerHTML = btn.dataset.html;
+      }
+    }
 
-      let itemsSummary = '';
-      document.querySelectorAll('#tableBody tr').forEach(row => {
-        const cell = row.cells[0];
-        if (!cell) return;
+    // ---------- PDF generation ----------
+    function safeFileName(raw, fallback) {
+      const n = String(raw || '').replace(/\.pdf$/i, '').replace(/[\\/:*?"<>|]+/g, '_').trim();
+      return (n || fallback) + '.pdf';
+    }
 
-        let name = cell.innerText.trim().replace(/\s+/g, ' ');
-        if (row.querySelector('input[name="album_size"]')) name = 'Album';
+    function defaultFileName() {
+      const c = document.getElementById('clientName').value.trim().replace(/\s+/g, '_');
+      const d = document.getElementById('billDate').value;
+      return `Estimate_${c ? c + '_' : ''}${d}`;
+    }
 
-        const note = cell.querySelector('input[type="text"]')?.value.trim();
-        if (note) name += ` (${note})`;
+    function saveBlob(blob, name) {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+    }
 
-        const qty = row.querySelector('.row-qty')?.value.trim() || '';
-        const rate = row.querySelector('.row-rate')?.value.trim() || '';
-        let amt = row.querySelector('.row-amount')?.value.trim() || '';
-        if (parseNum(amt) === 0) amt = '';
-        const state = row.querySelector('.toggle-cycle-btn')?.getAttribute('data-state');
+    // Renders the slip (#printArea) to a one-page A4 PDF and returns it as a Blob
+    async function buildPdfBlob() {
+      if (!window.html2canvas || !window.jspdf) {
+        throw new Error('PDF libraries could not load. Check your internet connection and reload the page.');
+      }
+      if (document.fonts && document.fonts.ready) await document.fonts.ready;
+      calculateSlip();
 
-        if (state === 'included' && !amt) {
-          itemsSummary += `• ${name}: [INCLUDED]\n`;
-        } else if (qty || rate || amt || note) {
-          const parts = [];
-          if (qty) parts.push(`Qty: ${qty}`);
-          if (rate) parts.push(`Rate: ₹${rate}`);
-          itemsSummary += `• ${name}${parts.length ? ` (${parts.join(', ')})` : ''}${amt ? `: ₹${amt}` : ''}\n`;
+      const area = document.getElementById('printArea');
+      const canvas = await html2canvas(area, {
+        scale: 2,
+        backgroundColor: '#ffffff',
+        useCORS: true,
+        logging: false,
+        windowWidth: 900,               // lay out at tablet/desktop width so the PDF always looks the same
+        scrollX: -window.scrollX,
+        scrollY: -window.scrollY,
+        onclone: doc => {
+          const a = doc.getElementById('printArea');
+          a.style.width = '860px';
+          a.style.maxWidth = '860px';
+          a.style.margin = '0';
+          a.style.boxShadow = 'none';
+          a.style.borderRadius = '0';
+          doc.body.style.background = '#ffffff';
+          doc.body.style.padding = '0';
+          doc.querySelectorAll('.no-print').forEach(el => { el.style.display = 'none'; });
+          doc.getElementById('signPlaceholder').style.display = 'none';
+          doc.querySelectorAll('#printArea input').forEach(i => { if (!i.value) i.placeholder = ''; });
         }
       });
 
-      let msg = `📸 *ORDER / ESTIMATION SLIP*\n`;
-      msg += `*Nirav Dabgar* | +91-9898230491\n`;
-      msg += `──────────────────────\n`;
-      msg += `👤 *Client:* ${client}\n`;
-      msg += `📅 *Date:* ${dateVal}\n`;
-      if (events.length) msg += `🎉 *Event:* ${events.join(', ')}\n`;
-      if (sizes.length) msg += `📐 *Album Size:* ${sizes.join(', ')}\n`;
-      msg += `──────────────────────\n`;
-      msg += `*Selected Particulars:*\n`;
-      msg += itemsSummary || `• Custom Photography / Videography Services\n`;
-      msg += `──────────────────────\n`;
-      msg += `💰 *TOTAL ESTIMATE:* ₹${total}\n`;
-      msg += `💳 *ADVANCE PAID:* ₹${advance}\n`;
-      msg += `🔖 *BALANCE DUE:* ₹${balance}\n`;
-      msg += `──────────────────────\n`;
-      msg += `_Complimentary Photo Calender, E Book, Mini Book, Photo Frame_\n`;
-      msg += `_E. & O. E._`;
+      const { jsPDF } = window.jspdf;
+      const pdf = new jsPDF({ unit: 'mm', format: 'a4', orientation: 'portrait' });
+      const pageW = pdf.internal.pageSize.getWidth();
+      const pageH = pdf.internal.pageSize.getHeight();
+      const margin = 8;
+      const ratio = Math.min((pageW - 2 * margin) / canvas.width, (pageH - 2 * margin) / canvas.height);
+      const w = canvas.width * ratio;
+      const h = canvas.height * ratio;
+      pdf.addImage(canvas.toDataURL('image/jpeg', 0.95), 'JPEG', (pageW - w) / 2, margin, w, h);
+      return pdf.output('blob');
+    }
 
-      const target = mob ? (mob.startsWith('91') ? mob : `91${mob}`) : '';
-      const url = target
-        ? `https://api.whatsapp.com/send?phone=${target}&text=${encodeURIComponent(msg)}`
-        : `https://api.whatsapp.com/send?text=${encodeURIComponent(msg)}`;
-      window.open(url, '_blank');
+    // PDF button: ask for a file name, then download straight away
+    async function downloadPdf() {
+      const btn = document.getElementById('btnPdf');
+      const raw = await showDialog({
+        title: 'Save PDF',
+        message: 'Enter a name for the file:',
+        withInput: true,
+        defaultValue: defaultFileName(),
+        okText: 'Download'
+      });
+      if (raw === null) return;
+      const name = safeFileName(raw, 'Estimate');
+
+      setBusy(btn, true, 'Creating PDF...');
+      try {
+        saveBlob(await buildPdfBlob(), name);
+      } catch (err) {
+        console.error(err);
+        await showDialog({ title: 'Could not create PDF', message: err.message || 'Something went wrong. Please try again.', okText: 'OK', cancelText: 'Close' });
+      } finally {
+        setBusy(btn, false);
+      }
+    }
+
+    // WhatsApp button: send the PDF itself (not a text summary)
+    async function shareWhatsApp() {
+      const btn = document.getElementById('btnWhatsApp');
+      const name = safeFileName(defaultFileName(), 'Estimate');
+      const digits = document.getElementById('clientMob').value.replace(/\D/g, '');
+      const phone = digits.length === 10 ? '91' + digits : digits;
+
+      const canShareFiles = !!(navigator.canShare &&
+        navigator.canShare({ files: [new File([''], 'a.pdf', { type: 'application/pdf' })] }));
+      // Open the fallback tab right now (inside the click) so popup blockers allow it
+      const waWin = canShareFiles ? null : window.open('about:blank', '_blank');
+
+      setBusy(btn, true, 'Creating PDF...');
+      try {
+        const blob = await buildPdfBlob();
+        const file = new File([blob], name, { type: 'application/pdf' });
+
+        if (canShareFiles) {
+          try {
+            await navigator.share({ files: [file], title: name });
+          } catch (e) {
+            if (e.name === 'AbortError') return;
+            // Tap permission expired while the PDF was being made: ask for one more tap
+            const go = await showDialog({ title: 'PDF ready', message: 'Tap Share, then choose WhatsApp.', okText: 'Share' });
+            if (go) {
+              try { await navigator.share({ files: [file], title: name }); }
+              catch (e2) { if (e2.name !== 'AbortError') throw e2; }
+            }
+          }
+          return;
+        }
+
+        // Browsers without file sharing: save the PDF and open the chat to attach it
+        saveBlob(blob, name);
+        if (waWin) waWin.location.href = phone ? `https://wa.me/${phone}` : 'https://web.whatsapp.com/';
+        await showDialog({
+          title: 'PDF downloaded',
+          message: `This browser cannot attach files to WhatsApp automatically. "${name}" is in your downloads. Attach it with the paperclip in the WhatsApp chat that just opened.`,
+          okText: 'OK',
+          cancelText: 'Close'
+        });
+      } catch (err) {
+        console.error(err);
+        if (waWin) waWin.close();
+        await showDialog({ title: 'Could not create PDF', message: err.message || 'Something went wrong. Please try again.', okText: 'OK', cancelText: 'Close' });
+      } finally {
+        setBusy(btn, false);
+      }
     }
 
     // ---------- Listeners ----------
@@ -660,7 +792,7 @@
       document.getElementById('advanceInput').addEventListener('input', calculateSlip);
       document.getElementById('btnReset').addEventListener('click', resetEntireForm);
       document.getElementById('btnWhatsApp').addEventListener('click', shareWhatsApp);
-      document.getElementById('btnPrint').addEventListener('click', () => window.print());
+      document.getElementById('btnPdf').addEventListener('click', downloadPdf);
     }
 
     window.addEventListener('DOMContentLoaded', () => {
